@@ -219,7 +219,19 @@ HRESULT RoHelper::WindowsCompareStringOrdinal(HSTRING one, HSTRING two,
   return mFpWindowsCompareStringOrdinal(one, two, result);
 }
 
-static ABI::Windows::System::IDispatcherQueueController** queueController;
+namespace {
+// Owns the single shared dispatcher queue controller for this process.
+// Using a ComPtr (rather than a raw pointer to a caller's out-parameter)
+// ensures the object's lifetime is managed correctly via COM reference
+// counting, and CopyTo() below hands each caller a properly AddRef'd
+// reference of its own. See:
+// https://github.com/jnschulze/flutter-webview-windows/issues (Multiple
+// webview windows in Dart isolates) for context on why the previous raw
+// static pointer implementation was unsafe.
+Microsoft::WRL::ComPtr<ABI::Windows::System::IDispatcherQueueController>
+    gDispatcherQueueController;
+}  // namespace
+
 HRESULT RoHelper::CreateDispatcherQueueController(
     DispatcherQueueOptions options,
     ABI::Windows::System::IDispatcherQueueController**
@@ -228,12 +240,22 @@ HRESULT RoHelper::CreateDispatcherQueueController(
     return E_FAIL;
   }
 
-  if(queueController == nullptr || *queueController == nullptr) {
-    auto result = mFpCreateDispatcherQueueController(options, dispatcherQueueController);
-    queueController = dispatcherQueueController;
-    return result;
+  if (dispatcherQueueController == nullptr) {
+    return E_POINTER;
   }
-  return mFpCreateDispatcherQueueController(options, dispatcherQueueController);
+
+  if (gDispatcherQueueController == nullptr) {
+    HRESULT hr = mFpCreateDispatcherQueueController(
+        options, gDispatcherQueueController.GetAddressOf());
+    if (FAILED(hr)) {
+      return hr;
+    }
+  }
+
+  // CopyTo performs an AddRef, so the caller receives a valid, independently
+  // owned reference rather than a dangling alias into someone else's
+  // out-parameter.
+  return gDispatcherQueueController.CopyTo(dispatcherQueueController);
 }
 
 HRESULT RoHelper::WindowsDeleteString(HSTRING one) {
