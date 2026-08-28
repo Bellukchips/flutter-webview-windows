@@ -219,6 +219,7 @@ HRESULT RoHelper::WindowsCompareStringOrdinal(HSTRING one, HSTRING two,
   return mFpWindowsCompareStringOrdinal(one, two, result);
 }
 
+static ABI::Windows::System::IDispatcherQueueController** queueController;
 HRESULT RoHelper::CreateDispatcherQueueController(
     DispatcherQueueOptions options,
     ABI::Windows::System::IDispatcherQueueController**
