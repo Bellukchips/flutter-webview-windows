@@ -226,6 +226,12 @@ HRESULT RoHelper::CreateDispatcherQueueController(
   if (!mWinRtAvailable) {
     return E_FAIL;
   }
+
+  if(queueController == nullptr || *queueController == nullptr) {
+    auto result = mFpCreateDispatcherQueueController(options, dispatcherQueueController);
+    queueController = dispatcherQueueController;
+    return result;
+  }
   return mFpCreateDispatcherQueueController(options, dispatcherQueueController);
 }
 
