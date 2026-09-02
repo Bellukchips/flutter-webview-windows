@@ -82,20 +82,36 @@ class WebviewController extends ValueNotifier<WebviewValue> {
   /// using  an optional [browserExePath], an optional [userDataPath]
   /// and optional Chromium command line arguments [additionalArguments].
   ///
-  /// The environment is shared between all WebviewController instances and
-  /// can be initialized only once. Initialization must take place before any
-  /// WebviewController is created/initialized.
+  /// By default (when [environmentId] is omitted or null), the environment
+  /// is shared between all WebviewController instances and can be
+  /// initialized only once for the lifetime of the process.
   ///
-  /// Throws [PlatformException] if the environment was initialized before.
+  /// Pass a distinct [environmentId] (e.g. an account id) to create an
+  /// independent, concurrently-alive environment instead — this lets
+  /// several environments (each with their own [userDataPath], i.e. their
+  /// own cookies/localStorage/profile) coexist in the same process at the
+  /// same time, rather than requiring every previous environment to be
+  /// fully disposed before the next one can be created. Each
+  /// [environmentId] can still only be initialized once until every
+  /// [WebviewController] created with that same [environmentId] has been
+  /// disposed.
+  ///
+  /// Initialization must take place before any WebviewController using
+  /// that [environmentId] is created/initialized.
+  ///
+  /// Throws [PlatformException] if the environment (for this
+  /// [environmentId]) was initialized before.
   static Future<void> initializeEnvironment(
       {String? userDataPath,
       String? browserExePath,
-      String? additionalArguments}) async {
+      String? additionalArguments,
+      String? environmentId}) async {
     return _pluginChannel
         .invokeMethod('initializeEnvironment', <String, dynamic>{
       'userDataPath': userDataPath,
       'browserExePath': browserExePath,
-      'additionalArguments': additionalArguments
+      'additionalArguments': additionalArguments,
+      'environmentId': environmentId,
     });
   }
 
@@ -181,7 +197,13 @@ class WebviewController extends ValueNotifier<WebviewValue> {
   Stream<bool> get containsFullScreenElementChanged =>
       _containsFullScreenElementChangedStreamController.stream;
 
-  WebviewController() : super(WebviewValue.uninitialized());
+  /// Optionally pins this controller to the environment created with a
+  /// matching `environmentId` in [initializeEnvironment]. Leave as null to
+  /// use the legacy shared/default environment.
+  final String? environmentId;
+
+  WebviewController({this.environmentId})
+      : super(WebviewValue.uninitialized());
 
   /// Initializes the underlying platform view.
   Future<void> initialize() async {
@@ -190,8 +212,10 @@ class WebviewController extends ValueNotifier<WebviewValue> {
     }
     _creatingCompleter = Completer<void>();
     try {
-      final reply =
-          await _pluginChannel.invokeMapMethod<String, dynamic>('initialize');
+      final reply = await _pluginChannel.invokeMapMethod<String, dynamic>(
+        'initialize',
+        <String, dynamic>{'environmentId': environmentId},
+      );
 
       _textureId = reply!['textureId'];
       _methodChannel = MethodChannel('$_pluginChannelPrefix/$_textureId');

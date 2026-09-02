@@ -219,18 +219,42 @@ HRESULT RoHelper::WindowsCompareStringOrdinal(HSTRING one, HSTRING two,
   return mFpWindowsCompareStringOrdinal(one, two, result);
 }
 
+// FIX (root cause of both: freeze+force-close saat pindah halaman DAN
+// halaman WebView "Tambah Akun" tidak mau load webnya): patch cache
+// sebelumnya di sini punya DUA bug sekaligus:
+//
+//   BUG A — `queueController = dispatcherQueueController;` menyimpan
+//   ALAMAT variabel lokal milik si pemanggil (parameter
+//   `dispatcherQueueController` itu sendiri adalah `IDispatcherQueueController**`
+//   yang ditunjuk ke variabel lokal caller). Begitu fungsi caller selesai
+//   (return), alamat itu jadi DANGLING — menunjuk ke stack memory yang
+//   sudah dipakai ulang untuk hal lain. Panggilan berikutnya membaca
+//   `*queueController` dari alamat yang sudah tidak valid itu —
+//   undefined behavior murni.
+//
+//   BUG B — `dispatcherQueueController = queueController;` di cabang
+//   "sudah ada cache" hanya me-reassign PARAMETER LOKAL fungsi ini
+//   sendiri, TIDAK PERNAH menulis balik ke variabel milik si pemanggil
+//   (seharusnya `*dispatcherQueueController = ...`). Jadi pemanggil
+//   kedua dst selalu mendapat pointer null/garbage — WebView2 milik
+//   akun itu tidak pernah punya dispatcher queue yang valid, yang
+//   membuat navigasinya (loadUrl ke web.whatsapp.com) tidak pernah
+//   benar-benar berjalan.
+//
+// Kedua bug ini bersama-sama menjelaskan kedua gejala yang dilaporkan:
+// kadang crash (kalau dangling pointer kebetulan berisi garbage
+// non-null yang lalu dipanggil method-nya lewat vtable acak), kadang
+// diam-diam gagal load (kalau kebetulan null).
+//
+// Fix yang benar: cache OBJEK controller-nya sendiri (bukan alamat
+// variabel lokal caller), dengan AddRef() yang semestinya (WinRT ABI
+// interface ini adalah turunan IUnknown, jadi refcounted seperti COM
+// biasa), dan tulis balik lewat `*dispatcherQueueController` — bukan
+// reassign parameter lokal.
 namespace {
-// Owns the single shared dispatcher queue controller for this process.
-// Using a ComPtr (rather than a raw pointer to a caller's out-parameter)
-// ensures the object's lifetime is managed correctly via COM reference
-// counting, and CopyTo() below hands each caller a properly AddRef'd
-// reference of its own. See:
-// https://github.com/jnschulze/flutter-webview-windows/issues (Multiple
-// webview windows in Dart isolates) for context on why the previous raw
-// static pointer implementation was unsafe.
-Microsoft::WRL::ComPtr<ABI::Windows::System::IDispatcherQueueController>
-    gDispatcherQueueController;
-}  // namespace
+ABI::Windows::System::IDispatcherQueueController*
+    g_cachedDispatcherQueueController = nullptr;
+}
 
 HRESULT RoHelper::CreateDispatcherQueueController(
     DispatcherQueueOptions options,
@@ -240,22 +264,38 @@ HRESULT RoHelper::CreateDispatcherQueueController(
     return E_FAIL;
   }
 
-  if (dispatcherQueueController == nullptr) {
-    return E_POINTER;
-  }
-
-  if (gDispatcherQueueController == nullptr) {
-    HRESULT hr = mFpCreateDispatcherQueueController(
-        options, gDispatcherQueueController.GetAddressOf());
-    if (FAILED(hr)) {
-      return hr;
+  if (g_cachedDispatcherQueueController == nullptr) {
+    ABI::Windows::System::IDispatcherQueueController* created = nullptr;
+    auto result = mFpCreateDispatcherQueueController(options, &created);
+    if (FAILED(result) || created == nullptr) {
+      *dispatcherQueueController = nullptr;
+      return result;
     }
+    // Simpan referensi kita sendiri untuk sisa umur proses ini — satu
+    // proses hanya butuh SATU DispatcherQueue di thread yang pertama
+    // kali membuat WebView2 controller (Windows hanya mengizinkan satu
+    // per thread untuk DQTYPE_THREAD_CURRENT); setiap WebviewPlatform/
+    // controller berikutnya di thread yang sama harus berbagi queue
+    // yang sama ini, bukan mencoba membuat yang baru.
+    created->AddRef();
+    g_cachedDispatcherQueueController = created;
+
+    // `created` di sini sudah membawa satu referensi milik caller
+    // (konvensi COM out-parameter) — kita AddRef terpisah untuk cache
+    // di atas, jadi hitungan referensinya tetap benar: satu untuk
+    // caller, satu untuk cache kita.
+    *dispatcherQueueController = created;
+    return result;
   }
 
-  // CopyTo performs an AddRef, so the caller receives a valid, independently
-  // owned reference rather than a dangling alias into someone else's
-  // out-parameter.
-  return gDispatcherQueueController.CopyTo(dispatcherQueueController);
+  // Sudah ada cache dari panggilan sebelumnya — kembalikan referensi
+  // TAMBAHAN ke objek controller yang SAMA dan ASLI (bukan alamat
+  // stack yang sudah dangling), lewat *dispatcherQueueController
+  // (bukan reassign parameter lokal), supaya pemanggil benar-benar
+  // menerima controller yang valid dan bisa Release() secara normal.
+  g_cachedDispatcherQueueController->AddRef();
+  *dispatcherQueueController = g_cachedDispatcherQueueController;
+  return S_OK;
 }
 
 HRESULT RoHelper::WindowsDeleteString(HSTRING one) {

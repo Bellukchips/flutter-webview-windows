@@ -56,8 +56,24 @@ class WebviewWindowsPlugin : public flutter::Plugin {
 
  private:
   std::unique_ptr<WebviewPlatform> platform_;
-  std::unique_ptr<WebviewHost> webview_host_;
+
+  // MULTI-ENVIRONMENT SUPPORT: previously a single `webview_host_` was
+  // shared by the whole process, so only ONE WebView2 environment
+  // (== one userDataPath == effectively one account) could be alive at
+  // a time; switching accounts required fully disposing the old
+  // environment before the new one could be created. Keyed by an
+  // explicit `environmentId` string from Dart (empty string "" is the
+  // legacy/default environment, kept for backward compatibility with
+  // callers that never pass one), this lets several environments —
+  // e.g. one per account — live side by side in the same process.
+  std::unordered_map<std::string, std::shared_ptr<WebviewHost>>
+      webview_hosts_;
   std::unordered_map<int64_t, std::unique_ptr<WebviewBridge>> instances_;
+  // Tracks which environmentId each texture_id/webview instance belongs
+  // to, so we know when an environment's last instance is gone and it's
+  // safe to erase that specific `WebviewHost` (without touching other
+  // environments' hosts).
+  std::unordered_map<int64_t, std::string> instance_environment_ids_;
 
   WNDCLASS window_class_ = {};
   flutter::TextureRegistrar* textures_;
@@ -65,7 +81,12 @@ class WebviewWindowsPlugin : public flutter::Plugin {
 
   bool InitPlatform();
 
+  // Returns the "environmentId" argument if present in `args` (nullable),
+  // or the empty string (legacy/default environment) otherwise.
+  static std::string GetEnvironmentId(const flutter::EncodableValue* args);
+
   void CreateWebviewInstance(
+      const flutter::EncodableValue* arguments,
       std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>>);
   // Called when a method is called on this plugin's channel from Dart.
   void HandleMethodCall(
@@ -105,13 +126,30 @@ WebviewWindowsPlugin::~WebviewWindowsPlugin() {
   UnregisterClass(window_class_.lpszClassName, nullptr);
 }
 
+// static
+std::string WebviewWindowsPlugin::GetEnvironmentId(
+    const flutter::EncodableValue* args) {
+  if (args) {
+    if (const auto* map = std::get_if<flutter::EncodableMap>(args)) {
+      auto id = GetOptionalValue<std::string>(*map, "environmentId");
+      if (id.has_value()) {
+        return *id;
+      }
+    }
+  }
+  return std::string();  // legacy/default shared environment
+}
+
 void WebviewWindowsPlugin::HandleMethodCall(
     const flutter::MethodCall<flutter::EncodableValue>& method_call,
     std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>> result) {
   if (method_call.method_name().compare(kMethodInitializeEnvironment) == 0) {
-    if (webview_host_) {
+    const auto environment_id = GetEnvironmentId(method_call.arguments());
+
+    if (webview_hosts_.find(environment_id) != webview_hosts_.end()) {
       return result->Error(kErrorCodeEnvironmentAlreadyInitialized,
-                           "The webview environment is already initialized");
+                           "The webview environment is already initialized"
+                           " for this environmentId");
     }
 
     if (!InitPlatform()) {
@@ -140,11 +178,15 @@ void WebviewWindowsPlugin::HandleMethodCall(
     std::optional<std::string> additional_args =
         GetOptionalValue<std::string>(map, "additionalArguments");
 
-    webview_host_ = std::move(WebviewHost::Create(
-        platform_.get(), user_data_wpath, browser_exe_wpath, additional_args));
-    if (!webview_host_) {
+    // Each environmentId gets its OWN ICoreWebView2Environment (own
+    // userDataPath/profile), so several accounts can each be genuinely
+    // isolated AND alive at the same time — not just one-at-a-time.
+    std::shared_ptr<WebviewHost> host(std::move(WebviewHost::Create(
+        platform_.get(), user_data_wpath, browser_exe_wpath, additional_args)));
+    if (!host) {
       return result->Error(kErrorCodeEnvironmentCreationFailed);
     }
+    webview_hosts_[environment_id] = std::move(host);
 
     return result->Success();
   }
@@ -162,7 +204,7 @@ void WebviewWindowsPlugin::HandleMethodCall(
   }
 
   if (method_call.method_name().compare(kMethodInitialize) == 0) {
-    return CreateWebviewInstance(std::move(result));
+    return CreateWebviewInstance(method_call.arguments(), std::move(result));
   }
 
   if (method_call.method_name().compare(kMethodDispose) == 0) {
@@ -170,6 +212,29 @@ void WebviewWindowsPlugin::HandleMethodCall(
       const auto it = instances_.find(*texture_id);
       if (it != instances_.end()) {
         instances_.erase(it);
+
+        // Only release the environment THIS instance belonged to, once
+        // no other instance is still using it — other accounts'
+        // environments/hosts are untouched, so they stay warm
+        // (concurrently alive) instead of being forced to reload.
+        std::string environment_id;
+        const auto env_it = instance_environment_ids_.find(*texture_id);
+        if (env_it != instance_environment_ids_.end()) {
+          environment_id = env_it->second;
+          instance_environment_ids_.erase(env_it);
+        }
+
+        bool environment_still_in_use = false;
+        for (const auto& kv : instance_environment_ids_) {
+          if (kv.second == environment_id) {
+            environment_still_in_use = true;
+            break;
+          }
+        }
+        if (!environment_still_in_use) {
+          webview_hosts_.erase(environment_id);
+        }
+
         return result->Success();
       }
     }
@@ -180,18 +245,39 @@ void WebviewWindowsPlugin::HandleMethodCall(
 }
 
 void WebviewWindowsPlugin::CreateWebviewInstance(
+    const flutter::EncodableValue* arguments,
     std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>> result) {
   if (!InitPlatform()) {
     return result->Error(kErrorUnsupportedPlatform,
                          "The platform is not supported");
   }
 
-  if (!webview_host_) {
-    webview_host_ = std::move(WebviewHost::Create(
-        platform_.get(), platform_->GetDefaultDataDirectory()));
-    if (!webview_host_) {
+  const auto environment_id = GetEnvironmentId(arguments);
+
+  std::shared_ptr<WebviewHost> host;
+  const auto host_it = webview_hosts_.find(environment_id);
+  if (host_it != webview_hosts_.end()) {
+    host = host_it->second;
+  } else if (environment_id.empty()) {
+    // Legacy behavior preserved: the default ("") environment is
+    // lazily created on first use if initializeEnvironment() was never
+    // called explicitly.
+    host = std::shared_ptr<WebviewHost>(std::move(WebviewHost::Create(
+        platform_.get(), platform_->GetDefaultDataDirectory())));
+    if (!host) {
       return result->Error(kErrorCodeEnvironmentCreationFailed);
     }
+    webview_hosts_[environment_id] = host;
+  } else {
+    // A non-default environmentId must be explicitly initialized first
+    // (it carries a specific userDataPath the caller chose deliberately
+    // — silently falling back to a shared default here is exactly the
+    // "two accounts silently sharing one profile" bug this design is
+    // meant to avoid).
+    return result->Error(
+        kErrorCodeInvalidId,
+        "No environment initialized for this environmentId. Call "
+        "initializeEnvironment(environmentId: ...) first.");
   }
 
   auto hwnd =
@@ -200,10 +286,11 @@ void WebviewWindowsPlugin::CreateWebviewInstance(
 
   std::shared_ptr<flutter::MethodResult<flutter::EncodableValue>>
       shared_result = std::move(result);
-  webview_host_->CreateWebview(
+  host->CreateWebview(
       hwnd, true, true,
-      [shared_result, this](std::unique_ptr<Webview> webview,
-                            std::unique_ptr<WebviewCreationError> error) {
+      [shared_result, this, environment_id](
+          std::unique_ptr<Webview> webview,
+          std::unique_ptr<WebviewCreationError> error) {
         if (!webview) {
           if (error) {
             return shared_result->Error(
@@ -221,6 +308,7 @@ void WebviewWindowsPlugin::CreateWebviewInstance(
             std::move(webview));
         auto texture_id = bridge->texture_id();
         instances_[texture_id] = std::move(bridge);
+        instance_environment_ids_[texture_id] = environment_id;
 
         auto response = flutter::EncodableValue(flutter::EncodableMap{
             {flutter::EncodableValue("textureId"),
