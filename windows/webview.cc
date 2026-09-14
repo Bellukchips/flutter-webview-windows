@@ -926,15 +926,59 @@ bool Webview::DropFile(const std::vector<std::wstring>& file_paths,
   point.x = static_cast<LONG>(x * scale_factor_);
   point.y = static_cast<LONG>(y * scale_factor_);
 
+  // A real OS-driven drag naturally produces DragEnter, then a
+  // *stream* of DragOver ticks spread over real time as the mouse
+  // moves, and only then Drop once the button is released — WebView2/
+  // Chromium's internal drag-state handling on the composition thread
+  // appears to expect that same shape. Firing DragEnter→DragOver→Drop
+  // back-to-back with no time for the UI thread's message queue to be
+  // pumped in between (composition input here is dispatched via that
+  // queue, not processed fully synchronously inside these COM calls)
+  // was observed to make WhatsApp Web's preview flash and then close
+  // itself right after — i.e. the page's own drop handling started
+  // optimistically, then the underlying drag state was invalidated a
+  // moment later. Spacing the calls out, and pumping messages during
+  // each wait, gives that internal machinery the time slice it seems
+  // to need.
+  auto pump_for = [](DWORD milliseconds) {
+    const DWORD deadline = GetTickCount() + milliseconds;
+    MSG msg;
+    while (GetTickCount() < deadline) {
+      while (PeekMessage(&msg, nullptr, 0, 0, PM_REMOVE)) {
+        TranslateMessage(&msg);
+        DispatchMessage(&msg);
+      }
+      Sleep(5);
+    }
+  };
+
   DWORD effect = DROPEFFECT_COPY;
   composition_controller3->DragEnter(data_object.get(), MK_LBUTTON, point,
                                       &effect);
+  pump_for(120);
+
+  // Two DragOver ticks (rather than one), each with its own pump,
+  // mirrors the multi-tick dragover stream a real drag produces —
+  // same reasoning already validated for the JS-based synthetic-event
+  // approach before this native path replaced it (see
+  // file_drop_injection.dart's buildFileDropAdvanceScript doc
+  // comment in the app repo for the original version of this
+  // rationale).
   effect = DROPEFFECT_COPY;
   composition_controller3->DragOver(MK_LBUTTON, point, &effect);
+  pump_for(100);
+
+  effect = DROPEFFECT_COPY;
+  composition_controller3->DragOver(MK_LBUTTON, point, &effect);
+  pump_for(100);
+
   effect = DROPEFFECT_COPY;
   const HRESULT hr =
       composition_controller3->Drop(data_object.get(), MK_LBUTTON, point,
                                      &effect);
+  // Give the drop itself a moment to be fully processed before this
+  // function (and the data_object/hglobal it owns) goes out of scope.
+  pump_for(150);
   return SUCCEEDED(hr);
 }
 
