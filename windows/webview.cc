@@ -945,6 +945,31 @@ bool Webview::DropFile(const std::vector<std::wstring>& file_paths,
     MSG msg;
     while (GetTickCount() < deadline) {
       while (PeekMessage(&msg, nullptr, 0, 0, PM_REMOVE)) {
+        // Discard (without dispatching) any leftover mouse/keyboard
+        // input still sitting in this thread's queue from the *real*
+        // OS drag gesture that just completed — desktop_drop already
+        // consumed that gesture to fire onDragDone, but e.g. a stray
+        // WM_LBUTTONUP at the physical cursor position can still be
+        // queued here. PeekMessage(nullptr, ...) pumps messages for
+        // *every* window this thread owns, including Flutter's own
+        // top-level window — dispatching that leftover input would
+        // replay it straight into Flutter's normal pointer pipeline,
+        // as a real click wherever the OS cursor physically is right
+        // now. That's independent of the synthetic drop coordinates
+        // passed to WebView2, and was the actual cause of WhatsApp
+        // Web's attach preview closing itself right after appearing:
+        // nothing was rejecting the file — a real, unintended click
+        // was dismissing the preview the normal way clicking outside
+        // it always does. Swallow input messages; still dispatch
+        // everything else (paint, timers, WebView2/composition-
+        // internal messages), which is what actually needs pumping.
+        const bool is_mouse_msg =
+            msg.message >= WM_MOUSEFIRST && msg.message <= WM_MOUSELAST;
+        const bool is_key_msg =
+            msg.message >= WM_KEYFIRST && msg.message <= WM_KEYLAST;
+        if (is_mouse_msg || is_key_msg) {
+          continue;
+        }
         TranslateMessage(&msg);
         DispatchMessage(&msg);
       }
