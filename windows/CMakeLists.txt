@@ -90,6 +90,8 @@ target_link_libraries(${PLUGIN_NAME} PRIVATE
   ${CMAKE_BINARY_DIR}/packages/Microsoft.Windows.ImplementationLibrary/build/native/Microsoft.Windows.ImplementationLibrary.targets
   flutter 
   flutter_wrapper_plugin
+  shell32
+  ole32
 )
 
 # Configure definitions and includes

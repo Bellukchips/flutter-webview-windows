@@ -426,6 +426,39 @@ class WebviewController extends ValueNotifier<WebviewValue> {
     return jsonDecode(data as String);
   }
 
+  /// Simulates a real, OS-trusted drag-and-drop of the given local
+  /// [filePaths] landing at the given position (in logical pixels,
+  /// same coordinate space as pointer/cursor methods).
+  ///
+  /// Unlike constructing a `File`/`DataTransfer` in JS and dispatching
+  /// synthetic `dragenter`/`dragover`/`drop` events (which always come
+  /// back with `event.isTrusted == false`, since that flag is set by
+  /// the browser engine itself and can't be forged from script), this
+  /// routes the drop through
+  /// `ICoreWebView2CompositionController3::DragEnter/DragOver/Drop` on
+  /// the native side — the documented WebView2 API for feeding a
+  /// composition-hosted WebView2 (as used here) a real drag-and-drop
+  /// operation. Chromium processes it through its actual native drop
+  /// pipeline, so pages see a fully trusted drop, indistinguishable
+  /// from dragging a file onto an ordinary (non-hosted) browser window.
+  ///
+  /// Returns `true` if the native side successfully queried the
+  /// required WebView2 interface and dispatched the drop (this needs
+  /// WebView2 Runtime >= 1370.28; on older runtimes this returns
+  /// `false` and no drop is simulated).
+  Future<bool> dropFile(List<String> filePaths, double x, double y) async {
+    if (_isDisposed) {
+      return false;
+    }
+    assert(value.isInitialized);
+    final ok = await _methodChannel.invokeMethod<bool>('dropFile', {
+      'filePaths': filePaths,
+      'x': x,
+      'y': y,
+    });
+    return ok ?? false;
+  }
+
   /// Posts the given JSON-formatted message to the current document.
   Future<void> postWebMessage(String message) async {
     if (_isDisposed) {

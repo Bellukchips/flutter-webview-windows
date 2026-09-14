@@ -1,5 +1,6 @@
 #include "webview.h"
 
+#include <shlobj.h>
 #include <wrl.h>
 
 #include <format>
@@ -846,6 +847,95 @@ bool Webview::ClearVirtualHostNameMapping(const std::string& hostName) {
 
   return webview->ClearVirtualHostNameToFolderMapping(
       util::Utf16FromUtf8(hostName).c_str());
+}
+
+bool Webview::DropFile(const std::vector<std::wstring>& file_paths,
+                       double x, double y) {
+  if (!IsValid() || file_paths.empty()) {
+    return false;
+  }
+
+  // DragEnter/DragOver/Drop were only added in
+  // ICoreWebView2CompositionController3 (WebView2 SDK >= 1.0.1370.28);
+  // query for it rather than assuming the installed WebView2 Runtime
+  // is new enough.
+  wil::com_ptr<ICoreWebView2CompositionController3> composition_controller3 =
+      composition_controller_.query<ICoreWebView2CompositionController3>();
+  if (!composition_controller3) {
+    return false;
+  }
+
+  // Build a CF_HDROP payload — the same clipboard/drag format Windows
+  // Explorer itself uses for real file drags — so WebView2/Chromium
+  // reads it exactly as if the OS had handed it a genuine file drop.
+  size_t total_chars = 1;  // final extra null terminator after the list
+  for (const auto& path : file_paths) {
+    total_chars += path.size() + 1;  // each path + its null terminator
+  }
+
+  const size_t drop_size =
+      sizeof(DROPFILES) + total_chars * sizeof(wchar_t);
+  HGLOBAL hglobal = GlobalAlloc(GHND, drop_size);
+  if (!hglobal) {
+    return false;
+  }
+
+  auto* drop_files = static_cast<DROPFILES*>(GlobalLock(hglobal));
+  if (!drop_files) {
+    GlobalFree(hglobal);
+    return false;
+  }
+  drop_files->pFiles = sizeof(DROPFILES);
+  drop_files->fWide = TRUE;
+
+  wchar_t* dst = reinterpret_cast<wchar_t*>(
+      reinterpret_cast<BYTE*>(drop_files) + sizeof(DROPFILES));
+  for (const auto& path : file_paths) {
+    wcscpy_s(dst, path.size() + 1, path.c_str());
+    dst += path.size() + 1;
+  }
+  *dst = L'\0';
+  GlobalUnlock(hglobal);
+
+  FORMATETC format = {CF_HDROP, nullptr, DVASPECT_CONTENT, -1,
+                      TYMED_HGLOBAL};
+  STGMEDIUM medium = {};
+  medium.tymed = TYMED_HGLOBAL;
+  medium.hGlobal = hglobal;
+
+  wil::com_ptr<IDataObject> data_object;
+  // SHCreateDataObject builds a minimal IDataObject implementation for
+  // us; a hand-rolled IDataObject would otherwise be needed just to
+  // hand WebView2 this one CF_HDROP format.
+  if (FAILED(SHCreateDataObject(nullptr, 0, nullptr, nullptr,
+                                 IID_PPV_ARGS(&data_object)))) {
+    GlobalFree(hglobal);
+    return false;
+  }
+  if (FAILED(data_object->SetData(&format, &medium, TRUE))) {
+    // data_object didn't take ownership; free it ourselves.
+    GlobalFree(hglobal);
+    return false;
+  }
+  // On success, data_object now owns hglobal's lifetime — do not free
+  // it here.
+
+  // Same logical→client coordinate scaling SetCursorPos/
+  // SetPointerUpdate already use for this composition-hosted webview.
+  POINT point;
+  point.x = static_cast<LONG>(x * scale_factor_);
+  point.y = static_cast<LONG>(y * scale_factor_);
+
+  DWORD effect = DROPEFFECT_COPY;
+  composition_controller3->DragEnter(data_object.get(), MK_LBUTTON, point,
+                                      &effect);
+  effect = DROPEFFECT_COPY;
+  composition_controller3->DragOver(MK_LBUTTON, point, &effect);
+  effect = DROPEFFECT_COPY;
+  const HRESULT hr =
+      composition_controller3->Drop(data_object.get(), MK_LBUTTON, point,
+                                     &effect);
+  return SUCCEEDED(hr);
 }
 
 void Webview::UpdateDownloadProgress(ICoreWebView2DownloadOperation* download) {

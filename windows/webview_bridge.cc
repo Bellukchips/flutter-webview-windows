@@ -6,6 +6,7 @@
 #include <format>
 
 #include "texture_bridge_gpu.h"
+#include "util/string_converter.h"
 
 namespace {
 constexpr auto kErrorInvalidArgs = "invalidArguments";
@@ -41,6 +42,7 @@ constexpr auto kMethodClearCache = "clearCache";
 constexpr auto kMethodSetCacheDisabled = "setCacheDisabled";
 constexpr auto kMethodSetPopupWindowPolicy = "setPopupWindowPolicy";
 constexpr auto kMethodSetFpsLimit = "setFpsLimit";
+constexpr auto kMethodDropFile = "dropFile";
 
 constexpr auto kEventType = "type";
 constexpr auto kEventValue = "value";
@@ -398,6 +400,43 @@ void WebviewBridge::HandleMethodCall(
     if (delta) {
       webview_->SetScrollDelta(delta->first, delta->second);
       return result->Success();
+    }
+    return result->Error(kErrorInvalidArgs);
+  }
+
+  // dropFile: {"filePaths": [string, ...], "x": double, "y": double}
+  if (method_name.compare(kMethodDropFile) == 0) {
+    const auto& map = std::get<flutter::EncodableMap>(*method_call.arguments());
+
+    const auto file_paths_it = map.find(flutter::EncodableValue("filePaths"));
+    const auto x_it = map.find(flutter::EncodableValue("x"));
+    const auto y_it = map.find(flutter::EncodableValue("y"));
+
+    if (file_paths_it != map.end() && x_it != map.end() &&
+        y_it != map.end()) {
+      const auto* file_paths_list =
+          std::get_if<flutter::EncodableList>(&file_paths_it->second);
+      const auto* x = std::get_if<double>(&x_it->second);
+      const auto* y = std::get_if<double>(&y_it->second);
+
+      if (file_paths_list && x && y) {
+        std::vector<std::wstring> file_paths;
+        file_paths.reserve(file_paths_list->size());
+        bool all_strings = true;
+        for (const auto& item : *file_paths_list) {
+          const auto* path = std::get_if<std::string>(&item);
+          if (!path) {
+            all_strings = false;
+            break;
+          }
+          file_paths.push_back(util::Utf16FromUtf8(*path));
+        }
+
+        if (all_strings) {
+          return result->Success(
+              flutter::EncodableValue(webview_->DropFile(file_paths, *x, *y)));
+        }
+      }
     }
     return result->Error(kErrorInvalidArgs);
   }

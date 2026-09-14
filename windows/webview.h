@@ -7,6 +7,8 @@
 #include <winrt/base.h>
 
 #include <functional>
+#include <string>
+#include <vector>
 
 class WebviewHost;
 
@@ -177,6 +179,34 @@ class Webview {
                                  const std::string& path,
                                  WebviewHostResourceAccessKind accessKind);
   bool ClearVirtualHostNameMapping(const std::string& hostName);
+
+  // Simulates a real, OS-trusted external drag-and-drop of the given
+  // local file paths landing at (x, y) (top-left-relative logical
+  // coordinates, same space as SetCursorPos/SetPointerUpdate).
+  //
+  // This exists because WebView2 renders in composition/offscreen mode
+  // here (see CreateSurface) — its actual HWND is a message-only
+  // window with no screen position, so a real Windows shell drag
+  // dropped by the user can never land on it directly, and there is no
+  // way to make a JS-synthesized `DragEvent`/`input.files` assignment
+  // carry `event.isTrusted == true` (that flag is set by the browser
+  // engine itself based on where the input genuinely came from, and
+  // cannot be forged from script). Sites with attachment-validation
+  // logic that checks trustedness (as WhatsApp Web's own drop handling
+  // appears to) will silently reject anything built the synthetic way.
+  //
+  // ICoreWebView2CompositionController3::DragEnter/DragOver/Drop (WebView2
+  // SDK >= 1.0.1370.28) is the documented, supported way to feed a
+  // composition-hosted WebView2 a drag-and-drop operation that
+  // Chromium processes through its real native drop pipeline — so the
+  // resulting DOM events are indistinguishable, from the page's point
+  // of view, from a drop performed directly onto a normal (non-hosted)
+  // browser window. Building the accompanying IDataObject as a plain
+  // CF_HDROP (the same clipboard/drag format Windows Explorer itself
+  // uses for file drags) is sufficient; WebView2 reads real file paths
+  // from it as if the OS had provided them, because it did.
+  bool DropFile(const std::vector<std::wstring>& file_paths, double x,
+                double y);
 
   void UpdateDownloadProgress(ICoreWebView2DownloadOperation* download);
 
