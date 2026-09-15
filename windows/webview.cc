@@ -76,6 +76,15 @@ Webview::Webview(
   webview_controller_->put_ShouldDetectMonitorScaleChanges(FALSE);
   webview_controller_->put_RasterizationScale(1.0);
 
+  // Composition-hosted WebViews do not receive Windows drops automatically.
+  // DropFile forwards them through CompositionController3, which rejects the
+  // operation when external drops are disabled.  Set this explicitly instead
+  // of relying on the WebView2 default.
+  if (auto controller4 =
+          webview_controller_.try_query<ICoreWebView2Controller4>()) {
+    controller4->put_AllowExternalDrop(TRUE);
+  }
+
   wil::com_ptr<ICoreWebView2Settings> settings;
   if (SUCCEEDED(webview_->get_Settings(settings.put()))) {
     settings2_ = settings.try_query<ICoreWebView2Settings2>();
@@ -927,13 +936,21 @@ bool Webview::DropFile(const std::vector<std::wstring>& file_paths,
   point.y = static_cast<LONG>(y * scale_factor_);
 
   DWORD effect = DROPEFFECT_COPY;
-  composition_controller3->DragEnter(data_object.get(), MK_LBUTTON, point,
-                                      &effect);
+  HRESULT hr = composition_controller3->DragEnter(
+      data_object.get(), MK_LBUTTON, point, &effect);
+  if (FAILED(hr)) {
+    return false;
+  }
+
   effect = DROPEFFECT_COPY;
-  composition_controller3->DragOver(MK_LBUTTON, point, &effect);
+  hr = composition_controller3->DragOver(MK_LBUTTON, point, &effect);
+  if (FAILED(hr)) {
+    composition_controller3->DragLeave();
+    return false;
+  }
+
   effect = DROPEFFECT_COPY;
-  const HRESULT hr =
-      composition_controller3->Drop(data_object.get(), MK_LBUTTON, point,
+  hr = composition_controller3->Drop(data_object.get(), MK_LBUTTON, point,
                                      &effect);
   return SUCCEEDED(hr);
 }
