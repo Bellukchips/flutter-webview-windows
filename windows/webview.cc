@@ -76,6 +76,21 @@ Webview::Webview(
   webview_controller_->put_ShouldDetectMonitorScaleChanges(FALSE);
   webview_controller_->put_RasterizationScale(1.0);
 
+  // Composition-hosted WebViews do not receive Windows drops
+  // automatically. DropFile() below forwards drops through
+  // ICoreWebView2CompositionController3, which silently rejects the
+  // operation if external drops aren't explicitly allowed first — the
+  // DragEnter/DragOver calls still "succeed" at the COM level (so a
+  // page can still see a dragenter and show an optimistic preview),
+  // but the actual Drop's file payload never lands, which is what
+  // produces a preview that flashes and then disappears, or the
+  // target page treating the drop as an invalid/unsupported file.
+  // Set this explicitly rather than relying on the WebView2 default.
+  if (auto controller4 =
+          webview_controller_.try_query<ICoreWebView2Controller4>()) {
+    controller4->put_AllowExternalDrop(TRUE);
+  }
+
   wil::com_ptr<ICoreWebView2Settings> settings;
   if (SUCCEEDED(webview_->get_Settings(settings.put()))) {
     settings2_ = settings.try_query<ICoreWebView2Settings2>();
@@ -927,15 +942,30 @@ bool Webview::DropFile(const std::vector<std::wstring>& file_paths,
   point.y = static_cast<LONG>(y * scale_factor_);
 
   DWORD effect = DROPEFFECT_COPY;
-  composition_controller3->DragEnter(data_object.get(), MK_LBUTTON, point,
+  HRESULT hr = composition_controller3->DragEnter(
+      data_object.get(), MK_LBUTTON, point, &effect);
+  if (FAILED(hr) || effect == DROPEFFECT_NONE) {
+    // effect == DROPEFFECT_NONE means WebView2 accepted the COM call
+    // but is refusing the drop internally (e.g. AllowExternalDrop
+    // wasn't actually applied) — treat that the same as a hard
+    // failure instead of ploughing ahead into DragOver/Drop, which is
+    // exactly what previously produced a drop that *looked* like it
+    // worked (DragEnter/Drop both returning S_OK) while the page
+    // never actually received a usable file.
+    return false;
+  }
+
+  effect = DROPEFFECT_COPY;
+  hr = composition_controller3->DragOver(MK_LBUTTON, point, &effect);
+  if (FAILED(hr) || effect == DROPEFFECT_NONE) {
+    composition_controller3->DragLeave();
+    return false;
+  }
+
+  effect = DROPEFFECT_COPY;
+  hr = composition_controller3->Drop(data_object.get(), MK_LBUTTON, point,
                                       &effect);
-  effect = DROPEFFECT_COPY;
-  composition_controller3->DragOver(MK_LBUTTON, point, &effect);
-  effect = DROPEFFECT_COPY;
-  const HRESULT hr =
-      composition_controller3->Drop(data_object.get(), MK_LBUTTON, point,
-                                     &effect);
-  return SUCCEEDED(hr);
+  return SUCCEEDED(hr) && effect != DROPEFFECT_NONE;
 }
 
 void Webview::UpdateDownloadProgress(ICoreWebView2DownloadOperation* download) {

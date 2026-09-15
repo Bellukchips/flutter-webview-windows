@@ -8,7 +8,10 @@ endif()
 set(PROJECT_NAME "webview_windows")
 
 set(WIL_VERSION "1.0.220914.1")
-set(WEBVIEW_VERSION "1.0.1210.39")
+# CompositionController3 supplies the native drag-and-drop pipeline used by
+# Webview::DropFile. It was introduced in 1.0.1370.28 — do not lower this
+# without also checking DropFile()/AllowExternalDrop still compile.
+set(WEBVIEW_VERSION "1.0.1370.28")
 
 message(VERBOSE "CMake system version is ${CMAKE_SYSTEM_VERSION} (using SDK ${CMAKE_VS_WINDOWS_TARGET_PLATFORM_VERSION})")
 
@@ -103,4 +106,4 @@ target_include_directories(${PLUGIN_NAME} INTERFACE
 # Set bundled libraries
 set(webview_windows_bundled_libraries
   PARENT_SCOPE
-) 
+)
