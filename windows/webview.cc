@@ -3,8 +3,10 @@
 #include <shlobj.h>
 #include <wrl.h>
 
+#include <chrono>
 #include <format>
 #include <iostream>
+#include <thread>
 
 #include "util/composition.desktop.interop.h"
 #include "util/string_converter.h"
@@ -932,8 +934,37 @@ bool Webview::DropFile(const std::vector<std::wstring>& file_paths,
     GlobalFree(hglobal);
     return false;
   }
-  // On success, data_object now owns hglobal's lifetime — do not free
-  // it here.
+
+  // Tell Chromium explicitly that this is a copy operation. Explorer places
+  // this format alongside CF_HDROP, and WebView2 uses it when deciding
+  // whether an external file drop is allowed. Without it, the composition
+  // controller can show the drop overlay but return DROPEFFECT_NONE during
+  // DragOver, which makes the attachment preview disappear.
+  HGLOBAL preferred_effect = GlobalAlloc(GHND, sizeof(DWORD));
+  if (!preferred_effect) {
+    return false;
+  }
+  auto* preferred_effect_value =
+      static_cast<DWORD*>(GlobalLock(preferred_effect));
+  if (!preferred_effect_value) {
+    GlobalFree(preferred_effect);
+    return false;
+  }
+  *preferred_effect_value = DROPEFFECT_COPY;
+  GlobalUnlock(preferred_effect);
+
+  FORMATETC preferred_format = {
+      static_cast<CLIPFORMAT>(RegisterClipboardFormat(
+          CFSTR_PREFERREDDROPEFFECT)),
+      nullptr, DVASPECT_CONTENT, -1, TYMED_HGLOBAL};
+  STGMEDIUM preferred_medium = {};
+  preferred_medium.tymed = TYMED_HGLOBAL;
+  preferred_medium.hGlobal = preferred_effect;
+  if (FAILED(data_object->SetData(&preferred_format, &preferred_medium, TRUE))) {
+    GlobalFree(preferred_effect);
+    return false;
+  }
+  // On success, data_object owns both HGLOBAL values.
 
   // Same logical→client coordinate scaling SetCursorPos/
   // SetPointerUpdate already use for this composition-hosted webview.
@@ -944,28 +975,40 @@ bool Webview::DropFile(const std::vector<std::wstring>& file_paths,
   DWORD effect = DROPEFFECT_COPY;
   HRESULT hr = composition_controller3->DragEnter(
       data_object.get(), MK_LBUTTON, point, &effect);
-  if (FAILED(hr) || effect == DROPEFFECT_NONE) {
-    // effect == DROPEFFECT_NONE means WebView2 accepted the COM call
-    // but is refusing the drop internally (e.g. AllowExternalDrop
-    // wasn't actually applied) — treat that the same as a hard
-    // failure instead of ploughing ahead into DragOver/Drop, which is
-    // exactly what previously produced a drop that *looked* like it
-    // worked (DragEnter/Drop both returning S_OK) while the page
-    // never actually received a usable file.
+  if (FAILED(hr)) {
     return false;
   }
 
+  // WhatsApp's React drop target commits its "attachment preview" state on
+  // the next renderer turn. Sending every drag phase in one synchronous
+  // native call makes Drop arrive before that turn, so the preview flashes
+  // briefly and is then removed. Keep the OS drag sequence intact, but give
+  // Chromium a short turn between phases, as a real Explorer drag does.
+  std::this_thread::sleep_for(std::chrono::milliseconds(120));
+
   effect = DROPEFFECT_COPY;
   hr = composition_controller3->DragOver(MK_LBUTTON, point, &effect);
-  if (FAILED(hr) || effect == DROPEFFECT_NONE) {
+  if (FAILED(hr)) {
     composition_controller3->DragLeave();
     return false;
   }
 
+  std::this_thread::sleep_for(std::chrono::milliseconds(120));
+
   effect = DROPEFFECT_COPY;
   hr = composition_controller3->Drop(data_object.get(), MK_LBUTTON, point,
                                       &effect);
-  return SUCCEEDED(hr) && effect != DROPEFFECT_NONE;
+  if (SUCCEEDED(hr)) {
+    // WebView2 may consume CF_HDROP after Drop returns. Keep the data object
+    // alive without blocking the platform thread, so Chromium can continue
+    // pumping its renderer and finish reading the file paths.
+    IDataObject* retained_data_object = data_object.detach();
+    std::thread([retained_data_object]() {
+      Sleep(1000);
+      retained_data_object->Release();
+    }).detach();
+  }
+  return SUCCEEDED(hr);
 }
 
 void Webview::UpdateDownloadProgress(ICoreWebView2DownloadOperation* download) {
